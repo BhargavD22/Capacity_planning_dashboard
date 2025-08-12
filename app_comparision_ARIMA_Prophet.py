@@ -1,152 +1,149 @@
+# app_comparison_ARIMA_Prophet_with_capacity.py
 import streamlit as st
 import pandas as pd
-import numpy as np
 from prophet import Prophet
 from statsmodels.tsa.arima.model import ARIMA
 import plotly.graph_objects as go
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-import math
+import numpy as np
 
-# ==============================
-# Load Data
-# ==============================
+st.set_page_config(page_title="Server Storage Forecast", layout="wide")
+
+# ================= Load CSV =================
 @st.cache_data
 def load_data():
-    #df = pd.read_csv("sql_servers_storage_dummy.csv", parse_dates=["snapshot_date"])
-    df = pd.read_csv("sql_servers_storage_dummy.csv", parse_dates=["snapshot_date"])
-    df = df.sort_values(by=["server_name", "snapshot_date"])
-    return df
+    uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
+    if uploaded_file is not None:
+        df = pd.read_csv(uploaded_file, parse_dates=["snapshot_date"])
+        return df
+    return None
 
 df = load_data()
 
-# ==============================
-# Sidebar Selections
-# ==============================
-st.sidebar.header("Configuration")
+if df is not None:
+    st.sidebar.header("Controls")
 
-server_list = ["All Servers"] + sorted(df["server_name"].unique().tolist())
-selected_server = st.sidebar.selectbox("Select Server", server_list)
+    # Forecast Model Choice
+    model_choice = st.sidebar.selectbox("Select Model", ["Prophet", "ARIMA"])
 
-model_choice = st.sidebar.multiselect(
-    "Select Forecast Model(s)",
-    ["Prophet", "ARIMA"],
-    default=["Prophet"]
-)
+    # Graph Choice
+    chart_choice = st.sidebar.selectbox(
+        "Select Graph Type", ["Line Chart", "Bar Chart"]
+    )
 
-graph_type = st.sidebar.selectbox(
-    "Select Graph Type",
-    ["Line", "Bar", "Area"],
-    index=0
-)
+    # Capacity Limit
+    capacity_limit = st.sidebar.slider(
+        "Set Capacity Limit (GB)", 
+        min_value=0, 
+        max_value=int(df["storage_used_gb"].max() * 2), 
+        value=int(df["storage_used_gb"].max())
+    )
 
-forecast_periods = st.sidebar.slider(
-    "Months to Forecast",
-    min_value=1,
-    max_value=36,
-    value=24
-)
+    # Server Selection
+    servers = df["server_name"].unique().tolist()
+    server_choice = st.sidebar.multiselect("Select Servers", servers, default=servers[0])
 
-# ==============================
-# Data Prep
-# ==============================
-if selected_server != "All Servers":
-    data = df[df["server_name"] == selected_server]
+    # Forecast Period
+    forecast_periods = st.sidebar.slider(
+        "Months to Forecast", min_value=1, max_value=36, value=12
+    )
+
+    # ================= Forecast Function =================
+    def forecast_prophet(data, periods):
+        df_train = data.rename(columns={"snapshot_date": "ds", "storage_used_gb": "y"})
+        m = Prophet()
+        m.fit(df_train)
+        future = m.make_future_dataframe(periods=periods, freq="MS")
+        forecast = m.predict(future)
+        return forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]]
+
+    def forecast_arima(data, periods):
+        df_train = data.set_index("snapshot_date")["storage_used_gb"]
+        model = ARIMA(df_train, order=(1, 1, 1))
+        model_fit = model.fit()
+        forecast_vals = model_fit.forecast(steps=periods)
+        forecast_df = pd.DataFrame({
+            "ds": pd.date_range(start=df_train.index[-1] + pd.offsets.MonthBegin(), periods=periods, freq="MS"),
+            "yhat": forecast_vals
+        })
+        forecast_df["yhat_lower"] = forecast_df["yhat"] * 0.95
+        forecast_df["yhat_upper"] = forecast_df["yhat"] * 1.05
+        return forecast_df
+
+    # ================= Plot Function =================
+    def plot_forecast(original, forecast, server):
+        fig = go.Figure()
+
+        # Historical Data
+        fig.add_trace(go.Scatter(
+            x=original["snapshot_date"], y=original["storage_used_gb"],
+            mode="lines+markers", name="Historical", line=dict(color="blue")
+        ))
+
+        # Forecast Data
+        fig.add_trace(go.Scatter(
+            x=forecast["ds"], y=forecast["yhat"],
+            mode="lines+markers", name="Forecast", line=dict(color="green")
+        ))
+
+        # Capacity Limit Line
+        fig.add_trace(go.Scatter(
+            x=pd.concat([original["snapshot_date"], forecast["ds"]]),
+            y=[capacity_limit] * (len(original) + len(forecast)),
+            mode="lines", name="Capacity Limit", line=dict(color="red", dash="dash")
+        ))
+
+        # Highlight points above capacity
+        breach_points = forecast[forecast["yhat"] > capacity_limit]
+        if not breach_points.empty:
+            fig.add_trace(go.Scatter(
+                x=breach_points["ds"], y=breach_points["yhat"],
+                mode="markers", name="Breach", marker=dict(color="red", size=10, symbol="circle")
+            ))
+
+        fig.update_layout(
+            title=f"Forecast for {server}",
+            xaxis_title="Date", yaxis_title="Storage Used (GB)",
+            legend=dict(orientation="h")
+        )
+
+        return fig
+
+    # ================= Main Loop =================
+    if len(server_choice) == 1:
+        server = server_choice[0]
+        df_server = df[df["server_name"] == server].copy()
+
+        if model_choice == "Prophet":
+            forecast_df = forecast_prophet(df_server, forecast_periods)
+        else:
+            forecast_df = forecast_arima(df_server, forecast_periods)
+
+        fig = plot_forecast(df_server, forecast_df, server)
+        st.plotly_chart(fig, use_container_width=True)
+
+    else:
+        combined_fig = go.Figure()
+        for server in server_choice:
+            df_server = df[df["server_name"] == server].copy()
+
+            if model_choice == "Prophet":
+                forecast_df = forecast_prophet(df_server, forecast_periods)
+            else:
+                forecast_df = forecast_arima(df_server, forecast_periods)
+
+            combined_fig.add_trace(go.Scatter(
+                x=forecast_df["ds"], y=forecast_df["yhat"],
+                mode="lines", name=f"{server} Forecast"
+            ))
+
+        combined_fig.add_trace(go.Scatter(
+            x=pd.date_range(df["snapshot_date"].min(), df["snapshot_date"].max() + pd.DateOffset(months=forecast_periods)),
+            y=[capacity_limit] * (len(pd.date_range(df["snapshot_date"].min(), df["snapshot_date"].max() + pd.DateOffset(months=forecast_periods)))),
+            mode="lines", name="Capacity Limit", line=dict(color="red", dash="dash")
+        ))
+
+        st.plotly_chart(combined_fig, use_container_width=True)
+
 else:
-    data = df.groupby("snapshot_date")["storage_used_gb"].sum().reset_index()
-    data["server_name"] = "All Servers"
-
-data = data.rename(columns={"snapshot_date": "ds", "storage_used_gb": "y"})
-
-# ==============================
-# Function to Calculate MAPE
-# ==============================
-def mean_absolute_percentage_error(y_true, y_pred):
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
-
-# ==============================
-# Prophet Forecast
-# ==============================
-def run_prophet(df, periods):
-    model = Prophet()
-    model.fit(df)
-    future = model.make_future_dataframe(periods=periods, freq='D')
-    forecast = model.predict(future)
-    return forecast
-
-# ==============================
-# ARIMA Forecast
-# ==============================
-def run_arima(df, periods):
-    df_arima = df.set_index("ds")["y"]
-    model = ARIMA(df_arima, order=(5,1,0))
-    model_fit = model.fit()
-    forecast = model_fit.forecast(steps=periods)
-    forecast_df = pd.DataFrame({"ds": pd.date_range(start=df["ds"].max() + pd.Timedelta(days=1), periods=periods), "yhat": forecast})
-    return forecast_df
-
-# ==============================
-# Run Selected Models
-# ==============================
-fig = go.Figure()
-metrics_data = []
-
-# Plot historical data
-fig.add_trace(go.Scatter(
-    x=data["ds"], y=data["y"],
-    mode="lines+markers",
-    name="Historical",
-    line=dict(color="blue")
-))
-
-if "Prophet" in model_choice:
-    forecast_prophet = run_prophet(data[["ds", "y"]], forecast_periods * 30)
-    fig.add_trace(go.Scatter(
-        x=forecast_prophet["ds"], y=forecast_prophet["yhat"],
-        mode="lines",
-        name="Prophet Forecast",
-        line=dict(color="green", dash="solid")
-    ))
-    mae = mean_absolute_error(data["y"], forecast_prophet.loc[:len(data)-1, "yhat"])
-    rmse = math.sqrt(mean_squared_error(data["y"], forecast_prophet.loc[:len(data)-1, "yhat"]))
-    mape = mean_absolute_percentage_error(data["y"], forecast_prophet.loc[:len(data)-1, "yhat"])
-    metrics_data.append(["Prophet", mae, rmse, mape])
-
-if "ARIMA" in model_choice:
-    forecast_arima = run_arima(data, forecast_periods * 30)
-    fig.add_trace(go.Scatter(
-        x=forecast_arima["ds"], y=forecast_arima["yhat"],
-        mode="lines",
-        name="ARIMA Forecast",
-        line=dict(color="orange", dash="dot")
-    ))
-    y_true = data["y"][-len(forecast_arima):]
-    y_pred = forecast_arima["yhat"][:len(y_true)]
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = math.sqrt(mean_squared_error(y_true, y_pred))
-    mape = mean_absolute_percentage_error(y_true, y_pred)
-    metrics_data.append(["ARIMA", mae, rmse, mape])
-
-# ==============================
-# Graph Type Control
-# ==============================
-if graph_type == "Bar":
-    for trace in fig.data:
-        trace.update(mode=None, type="bar")
-elif graph_type == "Area":
-    for trace in fig.data:
-        trace.update(fill="tozeroy")
-
-# ==============================
-# Display
-# ==============================
-st.title("📊 SQL Server Storage Capacity Planning Dashboard")
-
-st.plotly_chart(fig, use_container_width=True)
-
-# Metrics Table
-if metrics_data:
-    metrics_df = pd.DataFrame(metrics_data, columns=["Model", "MAE", "RMSE", "MAPE"])
-    st.subheader("📈 Model Performance Metrics")
-    st.dataframe(metrics_df)
-
+    st.warning("Please upload a CSV file to proceed.")
