@@ -3,5 +3,5 @@ pandas
 plotly
 prophet
 statsmodels
-sklearn
+scikit-learn
 
