@@ -12,6 +12,7 @@ import math
 # ==============================
 @st.cache_data
 def load_data():
+    #df = pd.read_csv("sql_servers_storage_dummy.csv", parse_dates=["snapshot_date"])
     df = pd.read_csv("sql_servers_storage_dummy.csv", parse_dates=["snapshot_date"])
     df = df.sort_values(by=["server_name", "snapshot_date"])
     return df
@@ -148,3 +149,4 @@ if metrics_data:
     metrics_df = pd.DataFrame(metrics_data, columns=["Model", "MAE", "RMSE", "MAPE"])
     st.subheader("📈 Model Performance Metrics")
     st.dataframe(metrics_df)
+
