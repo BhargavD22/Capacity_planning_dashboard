@@ -1,152 +1,120 @@
-# app_capacity_planning_compare.py
+# capacity_planning_dashboard.py
+
 import streamlit as st
 import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
 from prophet import Prophet
 from statsmodels.tsa.arima.model import ARIMA
-import plotly.graph_objects as go
-from datetime import timedelta
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-import numpy as np
 
-# =======================
-# Page Config
-# =======================
-st.set_page_config(
-    page_title="SQL Server Capacity Planning",
-    page_icon="💾",
-    layout="wide"
-)
-
-st.title("💾 SQL Server Capacity Planning Dashboard")
-st.markdown("Compare **Prophet** and **ARIMA** forecasting models for SQL Server storage usage with accuracy metrics.")
-
-# =======================
-# Load Data
-# =======================
+# ==== Load Data ====
 @st.cache_data
 def load_data():
-    df = pd.read_csv("sql_servers_storage_dummy.csv")
-    df["snapshot_date"] = pd.to_datetime(df["snapshot_date"])
+    df = pd.read_csv("sql_servers_storage_dummy.csv", parse_dates=["Date"])
     return df
 
 df = load_data()
 
-# =======================
-# Sidebar Controls
-# =======================
-servers = sorted(df["server_name"].unique())
-selected_server = st.sidebar.selectbox("Select a Server", servers)
+# ==== Streamlit UI ====
+st.title("📊 SQL Server Capacity Planning Dashboard")
 
-forecast_years = st.sidebar.slider("Forecast Horizon (Years)", 1, 5, 2)
-capacity_limit = st.sidebar.number_input("Capacity Limit (GB)", min_value=100, value=800)
-validation_months = st.sidebar.slider("Validation Period (Months)", 1, 12, 3)
+servers = df["Server"].unique()
+selected_server = st.selectbox("Select Server", ["All Servers"] + list(servers))
 
-# =======================
-# Prophet Forecast Function
-# =======================
-def forecast_prophet(server_df, forecast_days=365):
-    prophet_df = server_df.rename(columns={"snapshot_date": "ds", "storage_used_gb": "y"})
+graph_type = st.selectbox("Select Graph Type", ["Line", "Bar", "Area"])
+selected_models = st.multiselect("Select Models to Display", ["Prophet", "ARIMA"], default=["Prophet", "ARIMA"])
+
+# ==== Filter Data ====
+if selected_server != "All Servers":
+    data = df[df["Server"] == selected_server]
+else:
+    data = df.groupby("Date")["Storage_Used_GB"].sum().reset_index()
+    data["Server"] = "All Servers"
+
+# ==== Forecast Function ====
+def prophet_forecast(data, periods=24):
+    dfp = data.rename(columns={"Date": "ds", "Storage_Used_GB": "y"})
     model = Prophet()
-    model.fit(prophet_df[["ds", "y"]])
-    future = model.make_future_dataframe(periods=forecast_days)
+    model.fit(dfp)
+    future = model.make_future_dataframe(periods=periods, freq="MS")
     forecast = model.predict(future)
     return forecast[["ds", "yhat"]]
 
-# =======================
-# ARIMA Forecast Function
-# =======================
-def forecast_arima(server_df, forecast_days=365):
-    ts = server_df.set_index("snapshot_date")["storage_used_gb"]
-    model = ARIMA(ts, order=(2, 1, 2))
+def arima_forecast(data, periods=24):
+    series = data.set_index("Date")["Storage_Used_GB"]
+    model = ARIMA(series, order=(1, 1, 1))
     model_fit = model.fit()
-    forecast_result = model_fit.get_forecast(steps=forecast_days)
-    forecast_mean = forecast_result.predicted_mean
-    forecast_index = pd.date_range(ts.index[-1] + timedelta(days=1), periods=forecast_days)
-    return pd.DataFrame({"ds": forecast_index, "yhat": forecast_mean.values})
+    forecast = model_fit.forecast(steps=periods)
+    forecast_dates = pd.date_range(start=series.index[-1] + pd.DateOffset(months=1), periods=periods, freq="MS")
+    return pd.DataFrame({"ds": forecast_dates, "yhat": forecast.values})
 
-# =======================
-# Accuracy Calculation
-# =======================
-def calculate_accuracy(train_df, test_df, model_func):
-    forecast_days = len(test_df)
-    forecast_df = model_func(train_df, forecast_days)
-    forecast_df = forecast_df.set_index("ds").loc[test_df["snapshot_date"]]
-    y_true = test_df["storage_used_gb"].values
-    y_pred = forecast_df["yhat"].values
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
-    return mae, rmse, mape
+# ==== Forecast Models ====
+historical = data.copy()
 
-# =======================
-# Main Logic
-# =======================
-server_df = df[df["server_name"] == selected_server].copy()
-server_df.sort_values("snapshot_date", inplace=True)
+prophet_df = arima_df = None
+if "Prophet" in selected_models:
+    prophet_df = prophet_forecast(data)
+if "ARIMA" in selected_models:
+    arima_df = arima_forecast(data)
 
-# Split into train/test for validation
-validation_days = validation_months * 30
-train_df = server_df.iloc[:-validation_days]
-test_df = server_df.iloc[-validation_days:]
-
-# Calculate accuracy
-prophet_mae, prophet_rmse, prophet_mape = calculate_accuracy(train_df, test_df, forecast_prophet)
-arima_mae, arima_rmse, arima_mape = calculate_accuracy(train_df, test_df, forecast_arima)
-
-# Forecast for future
-forecast_days = forecast_years * 365
-prophet_forecast = forecast_prophet(server_df, forecast_days)
-arima_forecast = forecast_arima(server_df, forecast_days)
-
-# =======================
-# Display Accuracy Table
-# =======================
-st.subheader("📏 Model Accuracy (Validation Period)")
-accuracy_df = pd.DataFrame({
-    "Model": ["Prophet", "ARIMA"],
-    "MAE": [prophet_mae, arima_mae],
-    "RMSE": [prophet_rmse, arima_rmse],
-    "MAPE (%)": [prophet_mape, arima_mape]
-})
-st.table(accuracy_df)
-
-# =======================
-# Capacity Breach Check
-# =======================
-for model_name, forecast_df in [("Prophet", prophet_forecast), ("ARIMA", arima_forecast)]:
-    breach_rows = forecast_df[forecast_df["yhat"] >= capacity_limit]
-    if not breach_rows.empty:
-        breach_date = breach_rows.iloc[0]["ds"].date()
-        st.markdown(
-            f"<div style='background-color:#ffcccc;padding:10px;border-radius:5px;'>"
-            f"🚨 [{model_name}] Capacity Breach Alert: Expected to exceed {capacity_limit} GB on {breach_date}."
-            f"</div>",
-            unsafe_allow_html=True
-        )
-
-# =======================
-# Plot Comparison
-# =======================
-st.subheader(f"📊 Forecast Comparison for {selected_server}")
+# ==== Plotting ====
 fig = go.Figure()
 
-# Historical
-fig.add_trace(go.Scatter(x=server_df["snapshot_date"], y=server_df["storage_used_gb"],
-                         mode='lines', name='Historical Usage'))
+# Historical usage
+if graph_type == "Line":
+    fig.add_trace(go.Scatter(x=historical["Date"], y=historical["Storage_Used_GB"], name="Historical Usage", line=dict(color="blue", width=2)))
+elif graph_type == "Bar":
+    fig.add_trace(go.Bar(x=historical["Date"], y=historical["Storage_Used_GB"], name="Historical Usage", marker_color="blue"))
+elif graph_type == "Area":
+    fig.add_trace(go.Scatter(x=historical["Date"], y=historical["Storage_Used_GB"], fill="tozeroy", name="Historical Usage", line=dict(color="blue")))
 
 # Prophet forecast
-fig.add_trace(go.Scatter(x=prophet_forecast["ds"], y=prophet_forecast["yhat"],
-                         mode='lines', name='Prophet Forecast'))
+if prophet_df is not None:
+    if graph_type == "Line":
+        fig.add_trace(go.Scatter(x=prophet_df["ds"], y=prophet_df["yhat"], name="Prophet Forecast", line=dict(color="green", width=2)))
+    elif graph_type == "Bar":
+        fig.add_trace(go.Bar(x=prophet_df["ds"], y=prophet_df["yhat"], name="Prophet Forecast", marker_color="green"))
+    elif graph_type == "Area":
+        fig.add_trace(go.Scatter(x=prophet_df["ds"], y=prophet_df["yhat"], fill="tozeroy", name="Prophet Forecast", line=dict(color="green")))
 
 # ARIMA forecast
-fig.add_trace(go.Scatter(x=arima_forecast["ds"], y=arima_forecast["yhat"],
-                         mode='lines', name='ARIMA Forecast'))
+if arima_df is not None:
+    if graph_type == "Line":
+        fig.add_trace(go.Scatter(x=arima_df["ds"], y=arima_df["yhat"], name="ARIMA Forecast", line=dict(color="red", width=2)))
+    elif graph_type == "Bar":
+        fig.add_trace(go.Bar(x=arima_df["ds"], y=arima_df["yhat"], name="ARIMA Forecast", marker_color="red"))
+    elif graph_type == "Area":
+        fig.add_trace(go.Scatter(x=arima_df["ds"], y=arima_df["yhat"], fill="tozeroy", name="ARIMA Forecast", line=dict(color="red")))
 
-# Capacity limit line
-fig.add_trace(go.Scatter(x=pd.concat([server_df["snapshot_date"], prophet_forecast["ds"]]),
-                         y=[capacity_limit] * (len(server_df) + len(prophet_forecast)),
-                         mode='lines', name='Capacity Limit',
-                         line=dict(color='red', dash='dash')))
+# Capacity limit line (example: 1000 GB for All Servers, 500 GB for individual)
+capacity_limit = 1000 if selected_server == "All Servers" else 500
+fig.add_trace(go.Scatter(x=historical["Date"], y=[capacity_limit] * len(historical), name="Capacity Limit", line=dict(color="red", dash="dash")))
 
-fig.update_layout(height=500, xaxis_title="Date", yaxis_title="Storage Used (GB)")
+fig.update_layout(title=f"Storage Usage Forecast - {selected_server}", xaxis_title="Date", yaxis_title="Storage Used (GB)")
+
 st.plotly_chart(fig, use_container_width=True)
+
+# ==== Metrics Table ====
+st.subheader("📈 Forecast Performance (on historical data)")
+metrics = []
+train = historical[:-12]  # last year as test
+test = historical[-12:]
+
+if "Prophet" in selected_models:
+    prophet_hist = prophet_forecast(train, periods=12)
+    mae = mean_absolute_error(test["Storage_Used_GB"], prophet_hist["yhat"][-12:])
+    rmse = np.sqrt(mean_squared_error(test["Storage_Used_GB"], prophet_hist["yhat"][-12:]))
+    mape = np.mean(np.abs((test["Storage_Used_GB"] - prophet_hist["yhat"][-12:]) / test["Storage_Used_GB"])) * 100
+    metrics.append(["Prophet", mae, rmse, mape])
+
+if "ARIMA" in selected_models:
+    arima_hist = arima_forecast(train, periods=12)
+    mae = mean_absolute_error(test["Storage_Used_GB"], arima_hist["yhat"])
+    rmse = np.sqrt(mean_squared_error(test["Storage_Used_GB"], arima_hist["yhat"]))
+    mape = np.mean(np.abs((test["Storage_Used_GB"] - arima_hist["yhat"]) / test["Storage_Used_GB"])) * 100
+    metrics.append(["ARIMA", mae, rmse, mape])
+
+if metrics:
+    metrics_df = pd.DataFrame(metrics, columns=["Model", "MAE", "RMSE", "MAPE (%)"])
+    st.dataframe(metrics_df)
