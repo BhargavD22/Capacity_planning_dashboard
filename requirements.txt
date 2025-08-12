@@ -2,3 +2,5 @@ streamlit
 pandas
 plotly
 prophet
+arima
+statsmodels
