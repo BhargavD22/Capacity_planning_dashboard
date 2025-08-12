@@ -39,7 +39,7 @@ if uploaded_file is not None:
     server_list = ["All Servers"] + sorted(df["server_name"].unique())
     selected_server = st.sidebar.selectbox("Select Server", server_list)
     forecast_periods = st.sidebar.slider("Forecast Months", 1, 36, 12)
-    capacity_limit = st.sidebar.slider("Set Capacity Limit (GB)", 50, 1000, 500)
+    capacity_limit = st.sidebar.slider("Set Capacity Limit (GB)", 500, 10000, 5000)
 
     # -------------------------------
     # Filter data
@@ -133,3 +133,4 @@ if uploaded_file is not None:
 
 else:
     st.info("Please upload a CSV file to proceed.")
+
