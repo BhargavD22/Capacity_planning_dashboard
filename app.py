@@ -1,123 +1,96 @@
+# app.py
 import streamlit as st
 import pandas as pd
 from prophet import Prophet
 import plotly.graph_objects as go
 
 # =======================
-# 1. Load Data
+# 1. Page Config
+# =======================
+st.set_page_config(
+    page_title="SQL Server Capacity Planning Dashboard",
+    page_icon="💾",
+    layout="wide"
+)
+
+st.title("💾 SQL Server Capacity Planning Dashboard")
+st.markdown("Monitor storage trends and forecast future usage for your on-prem SQL servers.")
+
+# =======================
+# 2. Load Data
 # =======================
 @st.cache_data
 def load_data():
-    # For GitHub hosting:
-    # url = "https://raw.githubusercontent.com/<your-username>/<repo-name>/main/sql_servers_storage_dummy.csv"
-    # return pd.read_csv(url, parse_dates=["snapshot_date"])
-
-    # Local run:
-    return pd.read_csv("sql_servers_storage_dummy.csv", parse_dates=["snapshot_date"])
+    df = pd.read_csv("sql_servers_storage_dummy.csv")
+    df["snapshot_date"] = pd.to_datetime(df["snapshot_date"])
+    return df
 
 df = load_data()
 
 # =======================
-# 2. Sidebar Controls
+# 3. Sidebar Controls
 # =======================
-st.sidebar.title("⚙️ Controls")
+servers = ["All Servers"] + sorted(df["server_name"].unique())
+selected_server = st.sidebar.selectbox("Select a Server", servers)
+
 forecast_years = st.sidebar.slider("Forecast Horizon (Years)", 1, 5, 2)
-capacity_limit = st.sidebar.number_input("Capacity Limit per Server (GB)", min_value=100, max_value=2000, value=1000)
-show_confidence = st.sidebar.checkbox("Show Confidence Intervals", value=True)
+capacity_limit = st.sidebar.number_input("Capacity Limit (GB)", min_value=100, value=800)
 
 # =======================
-# 3. Forecast for all servers
+# 4. Single Server View & Breach Warning
 # =======================
-forecasts = []
-fig = go.Figure()
+if selected_server != "All Servers":
+    data_to_forecast = [selected_server]
 
-for server in df["server_name"].unique():
-    server_data = df[df["server_name"] == server].copy()
+    # Breach date calculation
+    server_data = df[df["server_name"] == selected_server].copy()
     server_data = server_data.rename(columns={"snapshot_date": "ds", "storage_used_gb": "y"})
 
-    # Fit model
-    m = Prophet()
-    m.fit(server_data)
+    m_temp = Prophet()
+    m_temp.fit(server_data)
+    future_temp = m_temp.make_future_dataframe(periods=forecast_years * 365)
+    forecast_temp = m_temp.predict(future_temp)
 
-    # Forecast
+    breach_rows = forecast_temp[forecast_temp["yhat"] >= capacity_limit]
+    if not breach_rows.empty:
+        breach_date = breach_rows.iloc[0]["ds"].date()
+        st.markdown(
+            f"<div style='background-color:#ffcccc;padding:10px;border-radius:5px;'>"
+            f"🚨 <b>Capacity Breach Alert:</b> Forecast shows this server will exceed "
+            f"<b>{capacity_limit} GB</b> on <b>{breach_date}</b>."
+            f"</div>",
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            f"<div style='background-color:#ccffcc;padding:10px;border-radius:5px;'>"
+            f"✅ <b>Safe:</b> No capacity breach expected within forecast horizon."
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+else:
+    data_to_forecast = df["server_name"].unique()
+
+# =======================
+# 5. Forecast & Charts
+# =======================
+for server in data_to_forecast:
+    st.subheader(f"📊 {server} - Storage Usage Forecast")
+
+    server_df = df[df["server_name"] == server].copy()
+    server_df = server_df.rename(columns={"snapshot_date": "ds", "storage_used_gb": "y"})
+
+    m = Prophet()
+    m.fit(server_df)
     future = m.make_future_dataframe(periods=forecast_years * 365)
     forecast = m.predict(future)
-    forecast["server_name"] = server
-    forecasts.append(forecast)
 
-    # Plot actual
-    fig.add_trace(go.Scatter(
-        x=server_data["ds"],
-        y=server_data["y"],
-        mode="lines",
-        name=f"{server} Actual"
-    ))
-
-    # Plot forecast
-    fig.add_trace(go.Scatter(
-        x=forecast["ds"],
-        y=forecast["yhat"],
-        mode="lines",
-        name=f"{server} Forecast"
-    ))
-
-    # Confidence intervals
-    if show_confidence:
-        fig.add_trace(go.Scatter(
-            x=forecast["ds"],
-            y=forecast["yhat_upper"],
-            mode="lines",
-            line=dict(dash="dot"),
-            name=f"{server} Upper Bound"
-        ))
-        fig.add_trace(go.Scatter(
-            x=forecast["ds"],
-            y=forecast["yhat_lower"],
-            mode="lines",
-            line=dict(dash="dot"),
-            name=f"{server} Lower Bound"
-        ))
-
-# =======================
-# 4. Capacity Line
-# =======================
-fig.add_trace(go.Scatter(
-    x=df["snapshot_date"],
-    y=[capacity_limit] * len(df["snapshot_date"]),
-    mode="lines",
-    line=dict(color="red", dash="dash"),
-    name="Capacity Limit"
-))
-
-fig.update_layout(
-    title="📊 Multi-Server Storage Capacity Forecast",
-    xaxis_title="Date",
-    yaxis_title="Storage Used (GB)",
-    template="plotly_white",
-    height=600
-)
-
-st.plotly_chart(fig, use_container_width=True)
-
-# =======================
-# 5. Servers Approaching Capacity
-# =======================
-all_forecasts = pd.concat(forecasts)
-
-# Filter only forecasted period (exclude historical)
-future_forecasts = all_forecasts[all_forecasts["ds"] > df["snapshot_date"].max()]
-
-# Check if any predicted usage exceeds capacity
-alerts = future_forecasts.groupby("server_name").apply(
-    lambda g: g[g["yhat"] >= capacity_limit].head(1)
-).reset_index(drop=True)
-
-st.subheader("⚠️ Servers Projected to Exceed Capacity")
-if alerts.empty:
-    st.success("No servers expected to exceed the capacity limit in the forecast horizon.")
-else:
-    st.dataframe(alerts[["server_name", "ds", "yhat"]].rename(columns={
-        "server_name": "Server",
-        "ds": "Date",
-        "yhat": "Forecasted Usage (GB)"
-    }))
+    # Plot
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=server_df["ds"], y=server_df["y"], mode='lines', name='Historical Usage'))
+    fig.add_trace(go.Scatter(x=forecast["ds"], y=forecast["yhat"], mode='lines', name='Forecast'))
+    fig.add_trace(go.Scatter(x=forecast["ds"], y=[capacity_limit]*len(forecast), 
+                             mode='lines', name='Capacity Limit', line=dict(color='red', dash='dash')))
+    fig.update_layout(height=400, xaxis_title="Date", yaxis_title="Storage Used (GB)")
+    st.plotly_chart(fig, use_container_width=True)
